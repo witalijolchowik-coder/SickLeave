@@ -1,0 +1,664 @@
+import React, { useState, useEffect, useMemo } from 'react';
+import { 
+  ShieldCheck, FileUp, Users, FileText, 
+  Trash2, CheckCircle2, AlertCircle, 
+  Copy, Search, Building2, Briefcase, Loader2, Info, Calendar, Database, Settings2, RefreshCw, Cloud, Download, Moon, Sun, FileSpreadsheet, Clock, CalendarDays, FolderSync, Layers, CalendarRange, Settings, SlidersHorizontal, FileCheck, X, Activity, Archive, Lock, AlertTriangle, History, TrendingUp, ChevronRight, Zap, LayoutGrid, ChevronDown, Clock8, Clock12
+} from 'lucide-react';
+import { initializeApp } from 'firebase/app';
+import { getAuth, signInAnonymously, onAuthStateChanged, signInWithCustomToken } from 'firebase/auth';
+import { getFirestore, doc, setDoc, onSnapshot, getDoc, collection, query, getDocs, deleteDoc } from 'firebase/firestore';
+
+// --- CONFIGURATION ---
+const firebaseConfig = JSON.parse(__firebase_config);
+const app = initializeApp(firebaseConfig);
+const auth = getAuth(app);
+const db = getFirestore(app);
+const appId = typeof __app_id !== 'undefined' ? __app_id : 'sick-leave-pro-polish-v1';
+
+const POLISH_HOLIDAYS = [
+  "2025-01-01", "2025-01-06", "2025-04-20", "2025-04-21", "2025-05-01", "2025-05-03", "2025-06-08", "2025-06-19", "2025-08-15", "2025-11-01", "2025-11-11", "2025-12-25", "2025-12-26",
+  "2026-01-01", "2026-01-06", "2026-04-05", "2026-04-06", "2026-05-01", "2026-05-03", "2026-05-24", "2026-06-04", "2026-08-15", "2026-11-01", "2026-11-11", "2026-12-25", "2026-12-26"
+];
+
+const COMPANY_MAP = {
+  'US': 'Ukrainian Service',
+  'PS': 'Personnel Service',
+  'PST': 'Personnel Support',
+  'HS': 'Human Support',
+  'HCS': 'Human Capital Support',
+  'FS': 'Foreign Service',
+  'BERGMAN': 'Bergman',
+  'RENESANS': 'Renesans'
+};
+
+const App = () => {
+  const [theme, setTheme] = useState('dark');
+  const [user, setUser] = useState(null);
+  const [employees, setEmployees] = useState([]);
+  const [dbMetadata, setDbMetadata] = useState({});
+  const [sickLeaveSheets, setSickLeaveSheets] = useState({}); 
+  const [zusMetadata, setZusMetadata] = useState({ lastUpdated: '', fileDate: '', projectStats: {}, prevProjectStats: {} });
+  const [processedData, setProcessedData] = useState([]);
+  const [selectedProject, setSelectedProject] = useState('all');
+  const [workHourMultiplier, setWorkHourMultiplier] = useState(8);
+  const [isLibraryLoaded, setIsLibraryLoaded] = useState(false);
+  const [loading, setLoading] = useState({ report: false, zus: false, processing: false, cloud: true, deleting: false });
+  const [showDbSettings, setShowDbSettings] = useState(false);
+  const [showDeleteConfirm, setShowDeleteConfirm] = useState(false);
+  const [modalMessage, setModalMessage] = useState(null);
+
+  // --- DATE HELPERS ---
+  const formatDateLocal = (date) => {
+    const year = date.getFullYear();
+    const month = String(date.getMonth() + 1).padStart(2, '0');
+    const day = String(date.getDate()).padStart(2, '0');
+    return `${year}-${month}-${day}`;
+  };
+
+  const getDefaultDates = () => {
+    const now = new Date();
+    const firstDay = new Date(now.getFullYear(), now.getMonth(), 1);
+    const lastDay = new Date(now.getFullYear(), now.getMonth() + 1, 0);
+    return { start: formatDateLocal(firstDay), end: formatDateLocal(lastDay) };
+  };
+
+  const [dateRange, setDateRange] = useState(getDefaultDates());
+
+  // --- HELPERS ---
+  const clean = (val) => String(val || "").trim();
+  const onlyDigits = (val) => String(val || "").replace(/\D/g, '');
+
+  const parseDate = (val) => {
+    if (!val || val === '---') return null;
+    if (val instanceof Date) return val;
+    if (typeof val === 'number') {
+      const d = new Date(Math.round((val - 25569) * 86400 * 1000));
+      d.setHours(0,0,0,0);
+      return isNaN(d.getTime()) ? null : d;
+    }
+    const s = clean(val);
+    if (s.includes('.') && s.split('.').length === 3) {
+      const p = s.split('.');
+      const d = new Date(`${p[2]}-${p[1]}-${p[0]}`);
+      if (!isNaN(d.getTime())) { d.setHours(0,0,0,0); return d; }
+    }
+    const dIso = new Date(s);
+    if (!isNaN(dIso.getTime())) { dIso.setHours(0,0,0,0); return dIso; }
+    return null;
+  };
+
+  const calculateWorkingDays = (start, end) => {
+    const dStart = parseDate(start); const dEnd = parseDate(end);
+    if (!dStart || !dEnd) return 0;
+    let count = 0; let cur = new Date(dStart);
+    while (cur <= dEnd) {
+      const day = cur.getDay();
+      const iso = cur.toISOString().split('T')[0];
+      if (day !== 0 && day !== 6 && !POLISH_HOLIDAYS.includes(iso)) count++;
+      cur.setDate(cur.getDate() + 1);
+    }
+    return count;
+  };
+
+  const fitColumns = (data) => {
+    if (!data || data.length === 0) return [];
+    return data[0].map((_, colIndex) => {
+      let maxLen = data.reduce((max, row) => {
+        const val = row[colIndex] ? String(row[colIndex]).length : 0;
+        return val > max ? val : max;
+      }, 10);
+      return { wch: Math.min(maxLen + 4, 55) };
+    });
+  };
+
+  // --- UI DATA ---
+  const projectsList = useMemo(() => {
+    const list = employees.map(e => String(e.project || "")).filter(p => p && p !== 'N/A' && p !== 'undefined');
+    return ['all', ...new Set(list)].sort();
+  }, [employees]);
+
+  const stats = useMemo(() => {
+    const filtered = selectedProject === 'all' ? employees : employees.filter(e => e.project === selectedProject);
+    const active = filtered.filter(e => !e.isArchived).length;
+    const archived = filtered.filter(e => e.isArchived).length;
+    const total = filtered.length;
+    const activePct = total > 0 ? Math.round((active / total) * 100) : 0;
+    const archivedPct = total > 0 ? Math.round((archived / total) * 100) : 0;
+    return { total, active, archived, activePct, archivedPct };
+  }, [selectedProject, employees]);
+
+  const zusDashboardData = useMemo(() => {
+    const current = zusMetadata.projectStats || {};
+    const prev = zusMetadata.prevProjectStats || {};
+    const allProj = [...new Set([...Object.keys(current), ...Object.keys(prev)])].sort();
+    return allProj.map(p => {
+      const cData = current[p] || { monthTotal: 0, activeNow: 0 };
+      const pData = prev[p] || { monthTotal: 0, activeNow: 0 };
+      return { project: String(p), month: cData.monthTotal, active: cData.activeNow, diff: cData.activeNow - pData.activeNow };
+    }).filter(d => d.month > 0 || d.active > 0 || d.diff !== 0);
+  }, [zusMetadata]);
+
+  // --- FIREBASE SYNC ---
+  useEffect(() => {
+    if (!window.XLSX) {
+      const script = document.createElement('script');
+      script.src = "https://cdn.jsdelivr.net/npm/xlsx-js-style@1.2.0/dist/xlsx.bundle.js";
+      script.async = true;
+      script.onload = () => setIsLibraryLoaded(true);
+      document.head.appendChild(script);
+    } else { setIsLibraryLoaded(true); }
+
+    const initAuth = async () => {
+      try {
+        if (typeof __initial_auth_token !== 'undefined' && __initial_auth_token) {
+          await signInWithCustomToken(auth, __initial_auth_token);
+        } else {
+          await signInAnonymously(auth);
+        }
+      } catch (e) { console.error("Firebase Login Error"); }
+    };
+    initAuth();
+    const unsub = onAuthStateChanged(auth, setUser);
+    return () => unsub();
+  }, []);
+
+  useEffect(() => {
+    if (!user) return;
+    const empRef = doc(db, 'artifacts', appId, 'public', 'data', 'registry', 'main_db');
+    const unsubEmp = onSnapshot(empRef, (snap) => {
+      if (snap.exists()) {
+        const data = snap.data();
+        setEmployees(Array.isArray(data.list) ? data.list : []);
+        setDbMetadata(data.metadata || {});
+      }
+      setLoading(prev => ({ ...prev, cloud: false }));
+    });
+
+    const zusMetaRef = doc(db, 'artifacts', appId, 'public', 'data', 'registry', 'zus_metadata');
+    const unsubZusMeta = onSnapshot(zusMetaRef, (snap) => {
+      if (snap.exists()) {
+        const data = snap.data();
+        setZusMetadata({
+          lastUpdated: String(data.updatedAt || ''),
+          fileDate: String(data.fileModificationDate || ''),
+          projectStats: data.projectStats || {},
+          prevProjectStats: data.prevProjectStats || {}
+        });
+      }
+    });
+
+    const zusDataColl = collection(db, 'artifacts', appId, 'public', 'data', 'zus_data');
+    const unsubZusData = onSnapshot(zusDataColl, (snap) => {
+      const allSheets = {};
+      snap.forEach(docSnap => {
+        try { allSheets[docSnap.id] = JSON.parse(docSnap.data().rows); } catch(e) {}
+      });
+      setSickLeaveSheets(allSheets);
+    });
+
+    return () => { unsubEmp(); unsubZusMeta(); unsubZusData(); };
+  }, [user]);
+
+  // --- DATA PARSING ---
+  const extractEntriesFromRow = (cells) => {
+    const results = [];
+    if (!cells || cells.length < 3) return results;
+
+    const rowString = cells.join('|');
+    const peselMatches = rowString.match(/\d{11}/g);
+    if (!peselMatches) return results;
+
+    peselMatches.forEach(p => {
+      const colIdx = cells.findIndex(c => String(c).includes(p));
+      if (colIdx === -1) return;
+
+      if (cells[colIdx + 5] && String(cells[colIdx + 5]).includes(" - ")) {
+        const [start, end] = String(cells[colIdx + 5]).split(" - ");
+        results.push({
+          pesel: p, start, end,
+          isOpieka: String(cells[colIdx + 6] || "").toUpperCase().includes('TAK'),
+          isSzpital: !['NIE', '-', '', 'NO'].includes(String(cells[colIdx + 7] || "").toUpperCase())
+        });
+      } else if (cells[colIdx + 3] && cells[colIdx + 4]) {
+        results.push({
+          pesel: p, start: String(cells[colIdx + 3]), end: String(cells[colIdx + 4]),
+          isOpieka: String(cells[colIdx + 5] || "").toUpperCase() === 'TAK',
+          isSzpital: String(cells[colIdx + 6] || "").toUpperCase() === 'TAK'
+        });
+      }
+    });
+    return results;
+  };
+
+  const handleReportUpload = async (e) => {
+    const files = Array.from(e.target.files);
+    if (!files.length || !window.XLSX || !user) return;
+    setLoading(prev => ({ ...prev, report: true }));
+    try {
+      const allNewEmployees = [];
+      const metadataUpdate = { ...dbMetadata };
+      for (const file of files) {
+        const data = await file.arrayBuffer();
+        const workbook = window.XLSX.read(new Uint8Array(data), { type: 'array' });
+        const rows = window.XLSX.utils.sheet_to_json(workbook.Sheets[workbook.SheetNames[0]], { header: 1 });
+        if (rows.length < 2) continue;
+        const headers = rows[0].map(h => clean(h).toLowerCase());
+        const isArchive = file.name.toLowerCase().includes('archiwum');
+        let projIdx = headers.findIndex(h => (h.includes('obecność') || h.includes('projekt')) && !h.includes('nazwisko') && !h.includes('imię'));
+        if (projIdx === -1) projIdx = 1;
+        const idx = { last: headers.findIndex(h => h.includes('nazwisko')), first: headers.findIndex(h => h.includes('imię')), pesel: headers.findIndex(h => h.includes('pesel')), empCol: headers.findIndex(h => h.includes('pracodawca')) };
+        rows.slice(1).forEach(cols => {
+          const pesel = clean(cols[idx.pesel]); if (!pesel || pesel.length < 5) return;
+          const projectName = clean(cols[projIdx]) || 'N/A';
+          let employerFull = clean(cols[idx.empCol === -1 ? 63 : idx.empCol]);
+          let shortCode = "UNKNOWN"; 
+          for (const [code, full] of Object.entries(COMPANY_MAP)) { if (String(employerFull).toLowerCase().includes(full.toLowerCase())) { shortCode = code; break; } }
+          if (!metadataUpdate[projectName]) metadataUpdate[projectName] = {};
+          metadataUpdate[projectName][isArchive ? 'archiveUpdate' : 'activeUpdate'] = new Date().toLocaleDateString('pl-PL');
+          allNewEmployees.push({ project: projectName, fullName: `${clean(cols[idx.last])} ${clean(cols[idx.first])}`.trim(), lastName: clean(cols[idx.last]), firstName: clean(cols[idx.first]), pesel, cleanPesel: onlyDigits(pesel), shortCode, isArchived: isArchive });
+        });
+      }
+      const docRef = doc(db, 'artifacts', appId, 'public', 'data', 'registry', 'main_db');
+      const snap = await getDoc(docRef);
+      const existing = snap.exists() ? snap.data().list : [];
+      const updatedKeys = new Set(allNewEmployees.map(emp => `${emp.project}-${emp.isArchived}`));
+      await setDoc(docRef, { list: [...existing.filter(e => !updatedKeys.has(`${e.project}-${e.isArchived}`)), ...allNewEmployees], metadata: metadataUpdate, updatedAt: new Date().toISOString() });
+      setShowDbSettings(false);
+    } catch (err) {}
+    setLoading(prev => ({ ...prev, report: false }));
+  };
+
+  const handleZusUpload = async (e) => {
+    const files = Array.from(e.target.files);
+    if (!files.length || !window.XLSX || !user) return;
+    setLoading(prev => ({ ...prev, zus: true }));
+    const formattedFileDate = new Date().toLocaleString('pl-PL', { day: '2-digit', month: '2-digit', year: 'numeric', hour: '2-digit', minute: '2-digit' });
+    const newSheets = { ...sickLeaveSheets };
+    let processedFiles = 0;
+    for (const file of files) {
+      const reader = new FileReader();
+      reader.onload = async (evt) => {
+        const wb = window.XLSX.read(new Uint8Array(evt.target.result), { type: 'array' });
+        wb.SheetNames.forEach(name => {
+          const sheetName = name.toUpperCase().trim();
+          let code = null;
+          Object.keys(COMPANY_MAP).forEach(c => { if ((sheetName + " " + file.name.toUpperCase()).includes(c)) code = c; });
+          const data = window.XLSX.utils.sheet_to_json(wb.Sheets[name], { header: 1 });
+          if (code) newSheets[code] = data;
+        });
+        processedFiles++;
+        if (processedFiles === files.length) {
+          const statsMap = {};
+          employees.forEach(emp => {
+            const pName = String(emp.project);
+            if (!statsMap[pName]) statsMap[pName] = { monthTotal: 0, activeNow: 0 };
+            const target = (emp.shortCode !== "UNKNOWN" && newSheets[emp.shortCode]) ? { [emp.shortCode]: newSheets[emp.shortCode] } : newSheets;
+            Object.entries(target).forEach(([_, rows]) => {
+              rows.forEach(cells => {
+                const entries = extractEntriesFromRow(cells);
+                entries.forEach(info => {
+                  if (info.pesel === emp.cleanPesel) {
+                    const dS = parseDate(info.start); const dE = parseDate(info.end);
+                    if (dS && dE) {
+                       if (dE >= new Date(new Date().getFullYear(), new Date().getMonth(), 1) && dS <= new Date(new Date().getFullYear(), new Date().getMonth() + 1, 0)) statsMap[pName].monthTotal++;
+                       if (new Date() >= dS && new Date() <= dE) statsMap[pName].activeNow++;
+                    }
+                  }
+                });
+              });
+            });
+          });
+          try {
+            await setDoc(doc(db, 'artifacts', appId, 'public', 'data', 'registry', 'zus_metadata'), { updatedAt: new Date().toISOString(), fileModificationDate: formattedFileDate, projectStats: statsMap, prevProjectStats: zusMetadata.projectStats || {} });
+            for (const [code, rows] of Object.entries(newSheets)) { await setDoc(doc(db, 'artifacts', appId, 'public', 'data', 'zus_data', code), { rows: JSON.stringify(rows) }); }
+          } catch (err) {}
+          setLoading(prev => ({ ...prev, zus: false }));
+        }
+      };
+      reader.readAsArrayBuffer(file);
+    }
+  };
+
+  const processData = () => {
+    setLoading(prev => ({ ...prev, processing: true }));
+    const results = [];
+    const fS = parseDate(dateRange.start); const fE = parseDate(dateRange.end);
+    setTimeout(() => {
+      employees.forEach(emp => {
+        if (selectedProject !== 'all' && String(emp.project) !== selectedProject) return;
+        const target = (emp.shortCode !== "UNKNOWN" && sickLeaveSheets[emp.shortCode]) ? { [emp.shortCode]: sickLeaveSheets[emp.shortCode] } : sickLeaveSheets;
+        Object.entries(target).forEach(([sheetId, rows]) => {
+          rows.forEach(cells => {
+            const entries = extractEntriesFromRow(cells);
+            entries.forEach(info => {
+              if (info.pesel === emp.cleanPesel) {
+                const dS = parseDate(info.start); const dE = parseDate(info.end);
+                if (dS && dE && (!fS || dE >= fS) && (!fE || dS <= fE)) {
+                  results.push({ proj: String(emp.project), comp: sheetId, name: emp.fullName, lastName: emp.lastName, firstName: emp.firstName, pesel: info.pesel, start: info.start, end: info.end, isOpieka: info.isOpieka, isSzpital: info.isSzpital });
+                }
+              }
+            });
+          });
+        });
+      });
+      const seen = new Set();
+      setProcessedData(results.sort((a,b) => (parseDate(b.start)||0)-(parseDate(a.start)||0)).filter(r => { const k=`${r.pesel}-${r.start}-${r.end}`; if(seen.has(k)) return false; seen.add(k); return true; }));
+      setLoading(prev => ({ ...prev, processing: false }));
+    }, 600);
+  };
+
+  const exportAbsencjaReport = () => {
+    if (!processedData.length || !window.XLSX) return;
+    const XLSX = window.XLSX;
+    const green = { fill: { fgColor: { rgb: "A9D08E" } }, font: { bold: true, sz: 11, name: 'Calibri' }, border: { top: {style: "thin"}, bottom: {style: "thin"}, left: {style: "thin"}, right: {style: "thin"} }, alignment: { horizontal: "center", vertical: "center" } };
+    const headers = ["Nazwisko", "Imię", "Pesel", "Rodzaj absencji", "Skrót", "OD", "DO", "Dni robocze", "Godziny", "Uwagi"];
+    const rows = processedData.map(r => {
+      const wd = calculateWorkingDays(r.start, r.end);
+      const extras = []; if (r.isOpieka) extras.push("opieka"); if (r.isSzpital) extras.push("szpital");
+      return [String(r.lastName).toUpperCase(), String(r.firstName).toUpperCase(), String(r.pesel), "Godziny chorobowe (L4)", "L4", r.start, r.end, wd, wd * workHourMultiplier, extras.join(", ")];
+    });
+    const ws = XLSX.utils.aoa_to_sheet([headers, ...rows]);
+    const wb = XLSX.utils.book_new(); XLSX.utils.book_append_sheet(wb, ws, "Absencja");
+    XLSX.writeFile(wb, `Raport_Absencja_${selectedProject === 'all' ? 'WSZYSTKIE' : selectedProject}.xlsx`);
+  };
+
+  const exportToyotaReport = () => {
+    const tRows = processedData.filter(r => r.proj.toUpperCase().includes('TOYOTA') || r.proj.toUpperCase().includes('TBPL'));
+    if (tRows.length === 0) { setModalMessage("Brak pracowników TOYOTA/TBPL w wynikach."); return; }
+    const headers = ["l.p.", "nazwisko i imię pracownika", "rodzaj nieobecności", "data od", "data do"];
+    const rows = tRows.map((r, i) => [i + 1, `${String(r.lastName).toUpperCase()} ${String(r.firstName).toUpperCase()}`, (r.isOpieka || r.isSzpital ? "L4 + opieka/szpital" : "L4"), r.start, r.end]);
+    const ws = XLSX.utils.aoa_to_sheet([headers, ...rows]);
+    const wb = XLSX.utils.book_new(); XLSX.utils.book_append_sheet(wb, ws, "RAPORT TBPL");
+    XLSX.writeFile(wb, `Raport L4_PS_${new Date().toLocaleDateString('pl-PL').replace(/\./g, '-')}.xlsx`);
+  };
+
+  const resetDatabase = async () => {
+    setLoading(prev => ({ ...prev, deleting: true }));
+    try {
+      await setDoc(doc(db, 'artifacts', appId, 'public', 'data', 'registry', 'main_db'), { list: [], metadata: {}, updatedAt: new Date().toISOString() });
+      await setDoc(doc(db, 'artifacts', appId, 'public', 'data', 'registry', 'zus_metadata'), { updatedAt: new Date().toISOString(), projectStats: {} });
+      setShowDeleteConfirm(false);
+    } catch (err) {}
+    setLoading(prev => ({ ...prev, deleting: false }));
+  };
+
+  if (!isLibraryLoaded) return <div className="h-screen flex items-center justify-center bg-[#b0b8c8]"><Loader2 className="animate-spin text-[#4b57db]" size={40} /></div>;
+
+  return (
+    <div className={theme === 'dark' ? 'dark' : ''}>
+      {/* MODIFIED: Deep dark blue gradient background instead of flat color 
+         Changed from bg-[#b0b8c8] to bg-gradient-to-br from-[#0a0c14] via-[#141726] to-[#0a0c14]
+      */}
+      <div className="min-h-screen bg-gradient-to-br from-[#0a0c14] via-[#141726] to-[#0a0c14] flex items-center justify-center p-4 font-sans text-[#e2e8f0]">
+        
+        {/* Main Dashboard Container */}
+        <div className="flex w-full max-w-[1400px] h-[850px] bg-[#1e2130] rounded-2xl shadow-2xl overflow-hidden border border-gray-700">
+          
+          <main className="flex-1 flex flex-col overflow-hidden">
+            
+            {/* Header */}
+            <header className="h-20 flex items-center justify-between px-8 border-b border-gray-800 shrink-0">
+              <div className="flex items-center gap-3">
+                <ShieldCheck className="w-8 h-8 text-[#4b57db]" />
+                <div className="flex items-baseline gap-2">
+                  <h1 className="text-2xl font-semibold text-white tracking-tight italic">SickLeave</h1>
+                  <span className="text-xl font-light text-[#94a3b8]">PRO</span>
+                </div>
+              </div>
+              <div className="flex items-center gap-4">
+                <div className="flex items-center gap-2 text-[#10b981] text-sm font-medium mr-4">
+                  <Cloud className="w-4 h-4 text-[#94a3b8]" />
+                  <span>Połączono</span>
+                  <div className="w-2 h-2 rounded-full bg-[#10b981]"></div>
+                </div>
+                
+                <button onClick={() => setShowDbSettings(true)} className="flex items-center gap-2 bg-[#262a3b] hover:bg-[#32364a] text-white px-4 py-2 rounded-lg font-medium transition-colors text-sm border border-gray-700">
+                  <FolderSync className="w-4 h-4 text-[#4b57db]" />
+                  Aktualizuj Rejestr
+                </button>
+
+                <div className="flex items-center bg-[#262a3b] rounded-full p-1 border border-gray-700">
+                  <button onClick={() => setTheme('light')} className={`w-8 h-8 rounded-full flex items-center justify-center ${theme === 'light' ? 'bg-gray-600 text-white shadow-sm' : 'text-[#94a3b8]'}`}><Sun size={14}/></button>
+                  <button onClick={() => setTheme('dark')} className={`w-8 h-8 rounded-full flex items-center justify-center ${theme === 'dark' ? 'bg-gray-600 text-white shadow-sm' : 'text-[#94a3b8]'}`}><Moon size={14}/></button>
+                </div>
+                
+                <button onClick={() => setShowDeleteConfirm(true)} className="w-10 h-10 rounded-lg flex items-center justify-center text-rose-400 hover:bg-rose-900/20 transition-all border border-gray-800">
+                  <Trash2 size={18}/>
+                </button>
+              </div>
+            </header>
+
+            <div className="flex-1 overflow-y-auto p-8 custom-scrollbar space-y-6">
+              
+              {/* TOP STATS ROW */}
+              <div className="grid grid-cols-1 md:grid-cols-3 gap-6">
+                <div className="bg-[#262a3b] rounded-xl p-5 border border-gray-700 shadow-sm flex flex-col">
+                  <h2 className="text-lg font-medium text-white mb-4">Wybór Projektu</h2>
+                  <div className="mt-auto">
+                    <label className="block text-[10px] text-[#94a3b8] mb-1 uppercase font-bold tracking-wider">Aktywne Projekty</label>
+                    <div className="relative">
+                      <select value={selectedProject} onChange={(e) => setSelectedProject(e.target.value)} className="w-full bg-[#1e2130] border border-gray-600 text-white rounded-lg py-2.5 pl-4 pr-10 appearance-none focus:outline-none focus:border-[#4b57db] text-sm">
+                        <option value="all">📁 Wszystkie Projekty ({projectsList.length - 1})</option>
+                        {projectsList.filter(p => p !== 'all').map(p => <option key={p} value={p}>{p}</option>)}
+                      </select>
+                      <ChevronDown className="absolute right-3 top-1/2 -translate-y-1/2 text-[#94a3b8] w-4 h-4 pointer-events-none" />
+                    </div>
+                  </div>
+                </div>
+
+                <div className="bg-[#262a3b] rounded-xl p-5 border border-gray-700 shadow-sm">
+                  <div className="flex justify-between items-center mb-4">
+                    <h2 className="text-lg font-medium text-white">Statystyki Rejestru</h2>
+                    <span className="text-sm text-[#94a3b8]">Razem <span className="text-white font-medium">{stats.total}</span></span>
+                  </div>
+                  <div className="flex justify-around items-center h-20">
+                    <div className="flex flex-col items-center gap-1">
+                      <div className="relative w-14 h-14">
+                        <svg className="w-14 h-14" viewBox="0 0 36 36">
+                          <path className="text-gray-700" d="M18 2.0845 a 15.9155 15.9155 0 0 1 0 31.831 a 15.9155 15.9155 0 0 1 0 -31.831" fill="none" stroke="currentColor" strokeWidth="3"></path>
+                          <path className="text-[#10b981]" style={{ strokeDasharray: `${stats.activePct}, 100` }} d="M18 2.0845 a 15.9155 15.9155 0 0 1 0 31.831 a 15.9155 15.9155 0 0 1 0 -31.831" fill="none" stroke="currentColor" strokeLinecap="round" strokeWidth="3"></path>
+                        </svg>
+                        <div className="absolute inset-0 flex items-center justify-center"><span className="text-[10px] font-bold text-white">{stats.active}</span></div>
+                      </div>
+                      <span className="text-[9px] text-[#94a3b8] font-black uppercase">Aktywni</span>
+                    </div>
+                    <div className="flex flex-col items-center gap-1">
+                      <div className="relative w-14 h-14">
+                        <svg className="w-14 h-14" viewBox="0 0 36 36">
+                          <path className="text-gray-700" d="M18 2.0845 a 15.9155 15.9155 0 0 1 0 31.831 a 15.9155 15.9155 0 0 1 0 -31.831" fill="none" stroke="currentColor" strokeWidth="3"></path>
+                          <path className="text-white" style={{ strokeDasharray: `${stats.archivedPct}, 100` }} d="M18 2.0845 a 15.9155 15.9155 0 0 1 0 31.831 a 15.9155 15.9155 0 0 1 0 -31.831" fill="none" stroke="currentColor" strokeLinecap="round" strokeWidth="3"></path>
+                        </svg>
+                        <div className="absolute inset-0 flex items-center justify-center"><span className="text-[10px] font-bold text-white">{stats.archived}</span></div>
+                      </div>
+                      <span className="text-[9px] text-[#94a3b8] font-black uppercase">Archiwum</span>
+                    </div>
+                  </div>
+                </div>
+
+                <div className="bg-[#262a3b] rounded-xl p-5 border border-gray-700 shadow-sm flex flex-col">
+                  <h2 className="text-lg font-medium text-white mb-4">Okres Analizy</h2>
+                  <div className="grid grid-cols-2 gap-4 mt-auto">
+                    <div>
+                      <label className="block text-[10px] text-[#94a3b8] mb-1 uppercase font-bold">Data Od</label>
+                      <input type="date" value={dateRange.start} onChange={(e) => setDateRange(prev => ({...prev, start: e.target.value}))} className="w-full bg-[#1e2130] border border-gray-600 text-white rounded-lg py-2 px-3 text-xs focus:outline-none dark:[color-scheme:dark]" />
+                    </div>
+                    <div>
+                      <label className="block text-[10px] text-[#94a3b8] mb-1 uppercase font-bold">Data Do</label>
+                      <input type="date" value={dateRange.end} onChange={(e) => setDateRange(prev => ({...prev, end: e.target.value}))} className="w-full bg-[#1e2130] border border-gray-600 text-white rounded-lg py-2 px-3 text-xs focus:outline-none dark:[color-scheme:dark]" />
+                    </div>
+                  </div>
+                </div>
+              </div>
+
+              {/* DYNAMICS SECTION */}
+              {zusDashboardData.length > 0 && (
+                <div className="bg-[#262a3b] rounded-xl p-6 border border-gray-700 shadow-sm">
+                  <h2 className="text-lg font-medium text-white mb-6 flex items-center gap-2">
+                    <TrendingUp className="text-[#4b57db] w-5 h-5"/>
+                    Monitorowane Projekty (Dynamika ZUS)
+                  </h2>
+                  <div className="grid grid-cols-1 sm:grid-cols-2 md:grid-cols-3 lg:grid-cols-4 gap-6">
+                     {zusDashboardData.map((d, i) => (
+                        <div key={i} className="bg-[#1e2130] p-4 rounded-xl border border-gray-800 hover:border-[#4b57db]/50 transition-all group shadow-inner">
+                           <div className="flex justify-between items-start mb-3">
+                              <span className="text-sm font-bold text-white truncate">{d.project}</span>
+                              <Zap className={`w-4 h-4 ${d.diff > 0 ? 'text-[#10b981]' : d.diff < 0 ? 'text-[#ef4444]' : 'text-gray-600'}`} />
+                           </div>
+                           <div className="flex items-end justify-between">
+                              <div>
+                                 <p className="text-[10px] text-[#94a3b8] font-bold uppercase">Aktywne L4</p>
+                                 <span className="text-xl font-black text-white">{d.active}</span>
+                              </div>
+                              {d.diff !== 0 && (
+                                <span className={`text-xs font-bold px-2 py-0.5 rounded-full ${d.diff > 0 ? 'bg-[#10b981]/20 text-[#10b981]' : 'bg-[#ef4444]/20 text-[#ef4444]'}`}>
+                                   {d.diff > 0 ? `+${d.diff}` : d.diff}
+                                </span>
+                              )}
+                           </div>
+                        </div>
+                     ))}
+                  </div>
+                </div>
+              )}
+
+              {/* MAIN CONTENT SPLIT */}
+              <div className="flex flex-col lg:flex-row gap-6">
+                {/* UPLOAD ZONE */}
+                <div className="w-full lg:w-80 flex flex-col gap-6 shrink-0 h-full">
+                  <div className="bg-[#262a3b] rounded-xl p-6 border border-gray-700 shadow-sm flex flex-col min-h-[300px]">
+                    <h2 className="text-lg font-medium text-white mb-4">Monitoring ZUS</h2>
+                    <label className="flex flex-col items-center justify-center p-8 border-2 border-dashed border-gray-600 rounded-xl bg-[#1e2130]/50 group cursor-pointer hover:border-[#4b57db] transition-all">
+                      <FileUp className="w-10 h-10 text-[#94a3b8] group-hover:text-[#4b57db] mb-3 transition-colors" />
+                      <p className="text-sm text-white font-medium text-center">Wgraj Pliki ZUS</p>
+                      <span className="text-[10px] text-[#94a3b8] mt-1 italic">Przeciągnij lub kliknij</span>
+                      <input type="file" className="hidden" multiple accept=".xls,.xlsx" onChange={handleZusUpload} />
+                    </label>
+                    <div className="mt-auto pt-6 border-t border-gray-800 text-[10px] text-[#94a3b8] flex items-center gap-2 italic">
+                       <History size={12}/> Ostatnia aktualizacja: {zusMetadata.fileDate || 'Brak danych'}
+                    </div>
+                  </div>
+                </div>
+
+                {/* TABLE AREA (Dynamic height) */}
+                <div className="flex-1 bg-[#262a3b] rounded-xl border border-gray-700 shadow-sm flex flex-col overflow-hidden p-6 h-fit min-h-[400px]">
+                  <div className="mb-6 flex flex-col gap-4">
+                    <button onClick={processData} className="w-full bg-[#4b57db] hover:bg-[#3a44ba] text-white py-4 rounded-xl flex items-center justify-center gap-3 font-black transition-all shadow-xl shadow-[#4b57db]/10 active:scale-[0.98] uppercase tracking-widest text-sm">
+                      <Search size={22} /> Szukaj Aktywnych Zwolnień
+                    </button>
+                    
+                    <div className="flex items-center justify-between gap-4 border-b border-gray-700 pb-4">
+                      {/* INTEGRATED BLOCK: Hours Switch + Absencja Button */}
+                      <div className="flex items-center bg-[#1e2130] p-1 rounded-xl border border-gray-800 shadow-inner">
+                         <div className="flex gap-1 mr-4 border-r border-gray-700 pr-4">
+                            <button onClick={() => setWorkHourMultiplier(8)} className={`flex items-center gap-2 px-4 py-2 rounded-lg text-[11px] font-black transition-all ${workHourMultiplier === 8 ? 'bg-[#4b57db] text-white shadow-lg' : 'text-[#94a3b8] hover:text-white'}`}>
+                              <Clock8 size={14}/> 8h
+                            </button>
+                            <button onClick={() => setWorkHourMultiplier(12)} className={`flex items-center gap-2 px-4 py-2 rounded-lg text-[11px] font-black transition-all ${workHourMultiplier === 12 ? 'bg-[#4b57db] text-white shadow-lg' : 'text-[#94a3b8] hover:text-white'}`}>
+                              <Clock12 size={14}/> 12h
+                            </button>
+                         </div>
+                         <button onClick={exportAbsencjaReport} className="bg-[#10b981] hover:bg-[#059669] text-white text-[10px] font-black px-6 py-2.5 rounded-lg transition-colors flex items-center gap-2 shadow-lg shadow-[#10b981]/10 uppercase tracking-tighter">
+                           <FileSpreadsheet size={16}/> Absencja (XLS)
+                         </button>
+                      </div>
+
+                      <button onClick={exportToyotaReport} className="bg-[#3b82f6] hover:bg-[#2563eb] text-white text-[10px] font-black px-6 py-2.5 rounded-lg transition-colors flex items-center gap-2 shadow-lg shadow-[#3b82f6]/10 uppercase tracking-tighter">
+                        <FileCheck size={16}/> Raport TBPL
+                      </button>
+                    </div>
+                  </div>
+
+                  <div className="w-full overflow-x-auto">
+                    <table className="w-full text-left border-collapse">
+                      <thead className="sticky top-0 bg-[#262a3b] z-10">
+                        <tr>
+                          <th className="py-4 px-3 text-[10px] font-black text-[#94a3b8] uppercase tracking-widest border-b border-gray-700">Pracownik / Projekt</th>
+                          <th className="py-4 px-3 text-[10px] font-black text-[#94a3b8] uppercase tracking-widest border-b border-gray-700 text-center">Data Od</th>
+                          <th className="py-4 px-3 text-[10px] font-black text-[#94a3b8] uppercase tracking-widest border-b border-gray-700 text-center">Data Do</th>
+                          <th className="py-4 px-3 text-[10px] font-black text-[#94a3b8] uppercase tracking-widest border-b border-gray-700 text-center">Firma</th>
+                        </tr>
+                      </thead>
+                      <tbody className="divide-y divide-gray-800">
+                        {processedData.map((r, i) => (
+                          <tr key={i} className="hover:bg-[#1e2130] transition-colors group">
+                            <td className="py-4 px-3">
+                              <div className="text-sm font-bold text-white group-hover:text-[#4b57db] transition-colors">{r.name}</div>
+                              <div className="text-[10px] text-[#94a3b8]">{r.proj}</div>
+                            </td>
+                            <td className="py-4 px-3 text-center">
+                              <span className="inline-block px-3 py-1 rounded-full text-[10px] font-black bg-[#3b82f6]/10 text-[#3b82f6] border border-[#3b82f6]/20 font-mono">{r.start}</span>
+                            </td>
+                            <td className="py-4 px-3 text-center">
+                              <span className="inline-block px-3 py-1 rounded-full text-[10px] font-black bg-[#ef4444]/10 text-[#ef4444] border border-[#ef4444]/20 font-mono">{r.end}</span>
+                            </td>
+                            <td className="py-4 px-3 text-center">
+                               <span className="text-[10px] font-black text-gray-500 uppercase">{r.comp}</span>
+                            </td>
+                          </tr>
+                        ))}
+                        {processedData.length === 0 && !loading.processing && (
+                          <tr>
+                            <td colSpan="4" className="py-20 text-center text-gray-600 italic font-medium">Brak danych. Wgraj pliki ZUS i kliknij Szukaj.</td>
+                          </tr>
+                        )}
+                      </tbody>
+                    </table>
+                  </div>
+                </div>
+              </div>
+            </div>
+          </main>
+        </div>
+
+        {/* REGISTRY MODAL */}
+        {showDbSettings && (
+          <div className="fixed inset-0 z-[200] flex items-center justify-center p-4 bg-black/70 backdrop-blur-sm">
+            <div className="bg-[#1e2130] p-10 rounded-2xl shadow-2xl border border-gray-700 max-w-lg w-full">
+                <div className="flex justify-between items-center mb-6">
+                  <h2 className="text-xl font-bold text-white uppercase tracking-tight italic">Aktualizacja Rejestru Pracowników</h2>
+                  <button onClick={() => setShowDbSettings(false)} className="text-[#94a3b8] hover:text-white transition-all"><X/></button>
+                </div>
+                <p className="text-sm text-[#94a3b8] mb-8">Wgraj pliki XLS z listami pracowników z SOZ, aby zaktualizować bazy projektów.</p>
+                <label className="flex flex-col items-center justify-center p-12 border-2 border-dashed border-gray-600 rounded-xl bg-[#262a3b] cursor-pointer hover:border-[#4b57db] transition-all group">
+                  {loading.report ? <Loader2 className="animate-spin text-[#4b57db]" size={48}/> : <>
+                    <FileUp size={48} className="text-[#4b57db] mb-4 group-hover:scale-110 transition-transform" />
+                    <span className="text-sm font-medium text-gray-300">Wybierz Pliki (XLS)</span>
+                  </>}
+                  <input type="file" className="hidden" multiple accept=".xls,.xlsx" onChange={handleReportUpload} />
+                </label>
+            </div>
+          </div>
+        )}
+
+        {/* DELETE MODAL */}
+        {showDeleteConfirm && (
+          <div className="fixed inset-0 z-[200] flex items-center justify-center p-4 bg-black/70 backdrop-blur-sm">
+            <div className="bg-[#1e2130] p-10 rounded-2xl shadow-2xl border border-gray-700 max-w-sm w-full text-center">
+              <AlertTriangle className="mx-auto text-[#ef4444] mb-4" size={48}/>
+              <h3 className="text-xl font-bold text-white mb-2 uppercase">Wyczyścić Dane?</h3>
+              <p className="text-[#94a3b8] text-sm mb-8">Ta operacja trwale usunie wszystkie bazy pracowników i historię zwolnień z chmury.</p>
+              <div className="flex gap-4">
+                <button onClick={() => setShowDeleteConfirm(false)} className="flex-1 py-3 bg-gray-700 text-white rounded-lg font-bold">Anuluj</button>
+                <button onClick={resetDatabase} className="flex-1 py-3 bg-[#ef4444] text-white rounded-lg font-bold">Usuń</button>
+              </div>
+            </div>
+          </div>
+        )}
+
+        {/* NOTIFICATION MODAL */}
+        {modalMessage && (
+          <div className="fixed inset-0 z-[250] flex items-center justify-center p-4 bg-black/50 backdrop-blur-sm">
+            <div className="bg-[#1e2130] rounded-2xl p-8 max-w-md w-full shadow-2xl border border-gray-700 animate-in zoom-in duration-200">
+              <h3 className="text-lg font-bold text-white uppercase mb-4 text-center tracking-widest italic">Informacja</h3>
+              <p className="text-[#94a3b8] text-center mb-8 font-medium">{String(modalMessage)}</p>
+              <button onClick={() => setModalMessage(null)} className="w-full py-3 bg-[#4b57db] text-white font-bold rounded-xl shadow-lg hover:bg-[#3a44ba] transition-colors">Rozumiem</button>
+            </div>
+          </div>
+        )}
+
+      </div>
+    </div>
+  );
+};
+
+export default App;
